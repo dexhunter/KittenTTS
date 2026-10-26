@@ -51,37 +51,44 @@ def unpack_tl2(buf, out_features, in_features):
     weight = torch.empty(out_features, groups, GROUP, dtype=torch.bfloat16)
     gamma = buf[:, :, :TL2_ROWS * 2].copy().view(np.float16).transpose(0, 2, 1)
     trits = np.empty((rows, TL2_ROWS, groups, GROUP), dtype=np.int8)
-    cursor = TL2_ROWS * 2
+    # Triples for 13 + magnitude, then 13 - magnitude, including 14 and 15.
+    # Pad each triple to a scalar word so indexing uses a scalar gather.
+    triples = np.frombuffer(
+        b"\x00\x00\x00\x00" b"\x00\x00\x01\x00" b"\x00\x01\xff\x00" b"\x00\x01\x00\x00"
+        b"\x00\x01\x01\x00" b"\x01\xff\xff\x00" b"\x01\xff\x00\x00" b"\x01\xff\x01\x00"
+        b"\x01\x00\xff\x00" b"\x01\x00\x00\x00" b"\x01\x00\x01\x00" b"\x01\x01\xff\x00"
+        b"\x01\x01\x00\x00" b"\x01\x01\x01\x00" b"\x02\xff\xff\x00" b"\x02\xff\x00\x00"
+        b"\x00\x00\x00\x00" b"\x00\x00\xff\x00" b"\x00\xff\x01\x00" b"\x00\xff\x00\x00"
+        b"\x00\xff\xff\x00" b"\xff\x01\x01\x00" b"\xff\x01\x00\x00" b"\xff\x01\xff\x00"
+        b"\xff\x00\x01\x00" b"\xff\x00\x00\x00" b"\xff\x00\xff\x00" b"\xff\xff\x01\x00"
+        b"\xff\xff\x00\x00" b"\xff\xff\xff\x00" b"\xfe\x01\x01\x00" b"\xfe\x01\x00\x00",
+        dtype=np.uint32,
+    )
 
-    for sub in range(4):
-        segment = buf[:, :, cursor:cursor + 200].reshape(rows, groups, 10, 20)
-        cursor += 200
-        packed = np.ascontiguousarray(segment[..., :16].transpose(0, 3, 1, 2))
-        magnitude = np.empty((rows, TL2_ROWS, groups, 10), dtype=np.uint8)
-        magnitude[:, 0::2] = packed & 0x0F                  # even rows: low nibble
-        magnitude[:, 1::2] = packed >> 4                    # odd rows: high nibble
+    # Keep all four sub-blocks together; adjacent nibbles encode adjacent rows.
+    payload = buf[:, :, TL2_ROWS * 2:].reshape(rows, groups, 4, 216)
+    segment = payload[..., :200].reshape(rows, groups, 4, 10, 20)
+    nibble_shifts = np.array([0, 4], dtype=np.uint8)
+    codes = (segment[..., :16, None] >> nibble_shifts) & 0x0F
+    signs = ((segment[..., 16:, None] >> np.arange(8, dtype=np.uint8)) & 1)
+    codes |= signs.reshape(rows, groups, 4, 10, 16, 2) << 4
+    block = trits.reshape(rows, TL2_ROWS, groups, 4, 32)
+    block[..., :30].reshape(rows, TL2_ROWS, groups, 4, 10, 3)[:] = (
+        triples[codes].view(np.int8).reshape(rows, groups, 4, 10, TL2_ROWS, 4)[..., :3]
+        .transpose(0, 4, 1, 2, 3, 5)
+    )
 
-        signs = np.ascontiguousarray(segment[..., 16:].transpose(0, 3, 1, 2))
-        negative = np.unpackbits(signs, axis=1, count=TL2_ROWS,
-                                 bitorder="little").astype(bool)
-        balanced = magnitude.astype(np.int16)
-        np.negative(balanced, out=balanced, where=negative)
-
-        n = balanced + 13                                   # balanced base 3 -> 0..26
-        block = trits[:, :, :, sub * 32:(sub + 1) * 32]
-        triple = np.empty((rows, TL2_ROWS, groups, 10, 3), dtype=np.int8)
-        triple[..., 0] = (n // 9) - 1
-        triple[..., 1] = ((n // 3) % 3) - 1
-        triple[..., 2] = (n % 3) - 1
-        block[..., :30] = triple.reshape(rows, TL2_ROWS, groups, 30)
-
-        tail_bytes = np.ascontiguousarray(buf[:, :, cursor:cursor + 16].transpose(0, 2, 1))
-        cursor += 16
-        tail = np.empty((rows, TL2_ROWS, groups), dtype=np.uint8)
-        tail[:, 0::2] = tail_bytes & 0x0F
-        tail[:, 1::2] = tail_bytes >> 4
-        block[..., 30] = (tail & 0x03).astype(np.int8) - 1
-        block[..., 31] = ((tail >> 2) & 0x03).astype(np.int8) - 1
+    # Gather each tail pair as one scalar, then view its two signed trits.
+    tail_pairs = np.frombuffer(
+        b"\xff\xff\x00\xff\x01\xff\x02\xff"
+        b"\xff\x00\x00\x00\x01\x00\x02\x00"
+        b"\xff\x01\x00\x01\x01\x01\x02\x01"
+        b"\xff\x02\x00\x02\x01\x02\x02\x02",
+        dtype=np.uint16,
+    )
+    tail = (payload[..., 200:, None] >> nibble_shifts) & 0x0F
+    block[..., 30:] = tail_pairs[tail].view(np.int8).reshape(
+        rows, groups, 4, TL2_ROWS, 2).transpose(0, 3, 1, 2, 4)
 
     values = torch.from_numpy(trits.reshape(out_features, groups, GROUP)).to(torch.bfloat16)
     scales = torch.from_numpy(
